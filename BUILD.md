@@ -144,6 +144,45 @@ sudo cp -a src-tauri/transcribe-libs/. /usr/lib/Handy/
 
 Resources only need re-copying if they change upstream (new icons, sounds, models, etc.).
 
+## Personal macOS build
+
+This checkout pins Prashant's `transcribe.cpp` fork at commit
+`6300061f06ae7e918ac87c1f4907368effa829d6`, including the Qwen3-ASR
+long-form decode-budget fix. Two Make targets provide a repeatable personal
+installation:
+
+```bash
+# Once: create/check a stable local signing identity and install dependencies.
+make personal-setup
+
+# Whenever needed: build, replace /Applications/Handy.app, and launch it.
+make personal-install
+```
+
+The one-time setup opens Keychain Access if the `Handy Personal Build` signing
+identity does not exist. Follow the printed Certificate Assistant settings to
+create a development-only self-signed code-signing certificate. On the first
+build, Keychain may ask whether `codesign` can use its private key; choose
+**Always Allow**.
+
+The install command compares the designated requirement of the installed and
+new bundles. It resets only Handy's Accessibility and Microphone TCC records
+when the requirement changes (normally the first switch from an official or
+ad-hoc build). Rebuilds signed by the same certificate preserve the existing
+grants. If macOS ever shows a stale enabled permission, recover with:
+
+```bash
+make personal-reset-permissions
+```
+
+Useful non-installing commands are `make personal-build` and
+`make personal-status`. The personal configuration builds only the `.app` and
+does not create updater artifacts. Do not distribute this bundle to other
+people: a self-signed certificate establishes stable local identity but is not
+Apple notarization. The personal build also disables the official updater
+endpoint so it cannot accidentally replace itself with an official build; use
+`make personal-install` for future updates.
+
 ## Troubleshooting
 
 ### macOS Accessibility remains enabled after a local rebuild
