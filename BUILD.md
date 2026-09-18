@@ -146,8 +146,8 @@ Resources only need re-copying if they change upstream (new icons, sounds, model
 
 ## Personal macOS build
 
-This checkout pins Prashant's `transcribe.cpp` fork at commit
-`6300061f06ae7e918ac87c1f4907368effa829d6`, including the Qwen3-ASR
+This checkout pins Prashant's `transcribe.cpp` fork in
+[`src-tauri/Cargo.toml`](src-tauri/Cargo.toml), including the Qwen3-ASR
 long-form decode-budget fix. Two Make targets provide a repeatable personal
 installation:
 

@@ -9,7 +9,8 @@ readonly BUNDLE_ID="com.pais.handy"
 readonly BUILT_APP="${REPO_ROOT}/src-tauri/target/release/bundle/macos/Handy.app"
 readonly INSTALLED_APP="/Applications/Handy.app"
 readonly PERSONAL_CONFIG="src-tauri/tauri.personal.conf.json"
-readonly FORK_REV="6300061f06ae7e918ac87c1f4907368effa829d6"
+FORK_REV="$(sed -n '/^\[patch.crates-io\]/,$ s/^transcribe-cpp = { git = "https:\/\/github.com\/primaprashant\/transcribe.cpp.git", rev = "\([0-9a-f]*\)" }.*/\1/p' "${REPO_ROOT}/src-tauri/Cargo.toml")"
+readonly FORK_REV
 
 die() {
   echo "error: $*" >&2
@@ -48,6 +49,7 @@ EOF
 }
 
 verify_fork_lock() {
+  [[ "${FORK_REV}" =~ ^[0-9a-f]{40}$ ]] || die "Cargo.toml must pin a full transcribe.cpp fork revision"
   local lockfile="${REPO_ROOT}/src-tauri/Cargo.lock"
   local expected="git+https://github.com/primaprashant/transcribe.cpp.git?rev=${FORK_REV}#${FORK_REV}"
   grep -Fq "${expected}" "${lockfile}" || die \
