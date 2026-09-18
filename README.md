@@ -1,6 +1,6 @@
-# Handy-work: Fixes for Qwen3-ASR
+# Handy-work: Long-form Qwen3-ASR and Cohere dictation
 
-Handy supports Qwen3-ASR models, but the transcription engine [has a bug](https://github.com/handy-computer/transcribe.cpp/issues/95) that makes them unusable for long recordings. This fork makes Qwen3-ASR models work inside Handy for long-form dictation on macOS.
+Handy supports Qwen3-ASR models, but the transcription engine [has a bug](https://github.com/handy-computer/transcribe.cpp/issues/95) that makes them unusable for long recordings. This fork makes Qwen3-ASR models work inside Handy for long-form dictation on macOS. It also adds pause-aware Cohere chunking and background transcription while recording.
 
 ---
 
@@ -10,7 +10,7 @@ My main use for voice typing is long-form dictation. I often talk for five to te
 
 Handy [doesn't work well](https://github.com/cjpais/Handy/issues/1332) for long-form dictation unless you're using a streaming model such as Parakeet Unified EN 0.6B or Nemotron Streaming 3.5. These models are fast, but their transcription quality is not good enough for my needs.
 
-Handy doesn't implement any chunking. For non-streaming models, the entire recording is sent to the model for transcription at once. Models like **Cohere Transcribe** only handle about 30 to 35 seconds of audio at a time. So, when used for long-form dictation, these models start producing low-quality transcriptions and leave out a lot of what was said.
+Upstream Handy doesn't implement this fork's Cohere chunking. For non-streaming models, the entire recording is sent to the model for transcription at once. Models like **Cohere Transcribe** only handle about 30 to 35 seconds of audio at a time. So, when used for long-form dictation, these models start producing low-quality transcriptions and leave out a lot of what was said.
 
 The Qwen3-ASR runtime accepts up to 1,200 seconds of audio. The 1,200-second input limit is enough for a 10-to-15-minute recording, so the full recording can be transcribed in one pass without splitting it into chunks. I also find that Qwen3-ASR 1.7B gives me good enough results in terms of WER and latency. All of this makes Qwen3-ASR 1.7B the best model for me.
 
@@ -32,6 +32,14 @@ I have made three changes:
 
 The personal build also disables Handy's official updater. An official release
 therefore cannot replace this build. Update it from this repository instead.
+
+## Cohere long-form dictation
+
+Cohere GGUF recordings (`transcribe-cpp`) are split at pauses into chunks of at most 35 seconds. During recording, a background worker starts after 50 seconds of captured audio and transcribes chunks through the same loaded model. Once it catches up, only one or two chunks remain when you stop. Slower inference or a late model load can leave a backlog and increase that wait.
+
+Select a Cohere GGUF model and disable capture VAD in settings to preserve pauses for the chunk planner. Record normally; no new mode or shortcut is required. History retranscription and file transcription plan chunks over the complete recording. Qwen3-ASR retains its full-recording path and the pinned engine fix.
+
+The Cohere implementation and tests live in [`transcription/cohere.rs`](src-tauri/src/managers/transcription/cohere.rs) and its submodules, with small integration points in the existing recording action and transcription manager. See [Cohere implementation and results](docs/cohere-long-form.md) for the retained experiment findings, limitations, and merge guidance.
 
 ## Keeping the forks up to date
 
