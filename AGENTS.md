@@ -2,6 +2,13 @@
 
 This file provides guidance to AI coding assistants working with code in this repository.
 
+## Fork priorities
+
+- This is a personal Handy fork for Qwen3-ASR long-form dictation. Read [README.md](README.md) for the fork's changes and rationale.
+- IMPORTANT: Minimize future upstream merge conflicts and maintenance: keep changes small, localized, and isolated in fork-specific scripts/configuration where practical; avoid unrelated refactors or formatting churn.
+- Continue merging upstream changes into both this fork and the `transcribe.cpp` fork while preserving the Qwen3-ASR long-form fix. Keep engine builds reproducible with a revision pin and lockfile, advancing both as the engine fork evolves; do not duplicate commit hashes or current versions in documentation.
+- For local macOS installs, use `make personal-setup` once, then `make personal-install`. Preserve the stable signing identity, app identity, and install path to retain permissions, and keep the official updater disabled for personal builds. See [BUILD.md](BUILD.md).
+
 ## Development Commands
 
 **Prerequisites:**
