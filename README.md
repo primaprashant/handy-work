@@ -18,27 +18,26 @@ So, I created this fork so that I can use the Qwen3-ASR 1.7B model. This is not 
 
 ## How Handy uses Qwen3-ASR through transcribe.cpp
 
-The official Qwen3-ASR runtime accepts up to 1,200 seconds of audio. You can see this in Qwen's [`MAX_ASR_INPUT_SECONDS`](https://github.com/QwenLM/Qwen3-ASR/blob/7c6daf77a2421100f5fb066495372c00129d39ff/qwen_asr/inference/utils.py) setting. Qwen's own example uses `max_new_tokens=256` and says to increase it for long audio in the [Qwen3-ASR documentation](https://github.com/QwenLM/Qwen3-ASR/blob/7c6daf77a2421100f5fb066495372c00129d39ff/README.md#python-package-usage).
+The official Qwen3-ASR runtime accepts up to 1,200 seconds of audio. You can see this in Qwen's [`MAX_ASR_INPUT_SECONDS`](https://github.com/QwenLM/Qwen3-ASR/blob/main/qwen_asr/inference/utils.py) setting. Qwen's own example uses `max_new_tokens=256` and says to increase it for long audio in the [Qwen3-ASR documentation](https://github.com/QwenLM/Qwen3-ASR/blob/main/README.md#python-package-usage).
 
-The `transcribe.cpp` implementation used by Handy had a different limit. Its Qwen3-ASR decoder used a fixed [`k_max_new = 256`](https://github.com/handy-computer/transcribe.cpp/blob/c6a32a76585e144a301a07d7eb66464523697d12/src/arch/qwen3_asr/model.cpp#L85-L86) for every recording. This limited the transcript to 256 generated tokens even when the model could accept much more audio. Once the decoder reached that limit, it returned an error and no transcript. This [hard limit of 256 tokens is a bug](https://github.com/handy-computer/transcribe.cpp/issues/95). In my use, recordings longer than roughly 30 seconds to one minute could hit the limit.
+The `transcribe.cpp` implementation used by Handy had a different limit. Its Qwen3-ASR decoder used a fixed `k_max_new = 256` for every recording. This limited the transcript to 256 generated tokens even when the model could accept much more audio. Once the decoder reached that limit, it returned an error and no transcript. This [hard limit of 256 tokens is a bug](https://github.com/handy-computer/transcribe.cpp/issues/95). In my use, recordings longer than roughly 30 seconds to one minute could hit the limit.
 
 ## What changed
 
 I have made three changes:
 
-1. The [`transcribe.cpp` fix](https://github.com/primaprashant/transcribe.cpp/commit/262635ec854d1dcecd6992194f71776537abc264) scales the Qwen3-ASR output budget with audio length for single and batch transcription.
-2. The [follow-up tests](https://github.com/primaprashant/transcribe.cpp/commit/6300061f06ae7e918ac87c1f4907368effa829d6) check both an 11-second recording and a 197-second recording. The long recording was truncated by the old 256-token limit and completes with the fix.
-3. Handy pins `transcribe-cpp` to that tested revision in [`src-tauri/Cargo.toml`](src-tauri/Cargo.toml). The macOS build script signs and installs the local app in a repeatable way.
+1. The [`transcribe.cpp` fork](https://github.com/primaprashant/transcribe.cpp) scales the Qwen3-ASR output budget with audio length for single and batch transcription.
+2. The engine fork's regression tests check both an 11-second recording and a 197-second recording. The long recording was truncated by the old 256-token limit and completes with the fix.
+3. Handy pins `transcribe-cpp` to a tested revision of the engine fork in [`src-tauri/Cargo.toml`](src-tauri/Cargo.toml). The macOS build script signs and installs the local app in a repeatable way.
 
 The personal build also disables Handy's official updater. An official release
 therefore cannot replace this build. Update it from this repository instead.
 
-## Versions
+## Keeping the forks up to date
 
-This fork currently uses:
+Both this repository and the `transcribe.cpp` fork continue to incorporate upstream changes while preserving the long-form transcription fix. Changes stay small and localized to minimize merge conflicts and maintenance.
 
-- Handy `0.9.6`, based on upstream commit [`c6fa60d`](https://github.com/cjpais/Handy/commit/c6fa60da2f13a5af660fba17f37af548855119c5)
-- My `transcribe.cpp` fork at commit [`6300061`](https://github.com/primaprashant/transcribe.cpp/commit/6300061f06ae7e918ac87c1f4907368effa829d6)
+The engine revision is pinned in [`src-tauri/Cargo.toml`](src-tauri/Cargo.toml) and resolved in [`src-tauri/Cargo.lock`](src-tauri/Cargo.lock) for reproducible builds. Advance these together as the engine fork evolves, verifying that long-form transcription still works. These files are the source of truth for the dependency version.
 
 ## Install on macOS
 
