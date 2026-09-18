@@ -36,6 +36,10 @@ use transcribe_rs::{
     SpeechModel, TranscribeOptions,
 };
 
+mod cohere;
+
+use cohere::{recording_worker_path_available, should_use_long_form_chunking};
+
 const STREAM_PERF_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const STREAM_FINALIZE_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -100,10 +104,16 @@ pub struct StreamPhaseEvent {
 /// is processed before finalize runs.
 enum StreamCmd {
     Feed(Vec<f32>),
-    /// Flush the stream and reply with the final text, or `None` if no stream
-    /// was ever active (caller should fall back to batch transcription).
-    Finalize(mpsc::Sender<Option<FinalizedStreamText>>),
+    /// Flush the recording worker and distinguish an unavailable fast path
+    /// from a fatal rolling-batch error.
+    Finalize(mpsc::Sender<RecordingWorkerReply>),
     Cancel,
+}
+
+enum RecordingWorkerReply {
+    Unavailable,
+    Completed(FinalizedStreamText),
+    Failed(String),
 }
 
 struct FinalizedStreamText {
@@ -111,6 +121,15 @@ struct FinalizedStreamText {
     output_language: OutputLanguageEvidence,
     /// The streaming model's supported languages, for text-based detection.
     supported_languages: Vec<String>,
+    /// Silence is a successful complete Cohere result, while an empty native
+    /// stream retains its existing batch-fallback behavior.
+    empty_is_complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordingWorkerIntent {
+    NativeStream,
+    CohereRollingBatch,
 }
 
 /// Routes real-time audio frames to the active streaming worker. Shared between
@@ -277,6 +296,9 @@ pub struct TranscriptionManager {
     /// `is_model_loaded()` consults this so the model still reports "loaded"
     /// while the worker holds it.
     active_engine_lease: Arc<AtomicU64>,
+    /// Set synchronously by `cancel_stream` so a rolling worker can observe
+    /// cancellation between model calls even when the channel has queued audio.
+    rolling_cancel_requested: Arc<AtomicBool>,
 }
 
 impl TranscriptionManager {
@@ -297,6 +319,7 @@ impl TranscriptionManager {
             next_stream_worker_id: Arc::new(AtomicU64::new(1)),
             active_stream_worker: Arc::new(AtomicU64::new(0)),
             active_engine_lease: Arc::new(AtomicU64::new(0)),
+            rolling_cancel_requested: Arc::new(AtomicBool::new(false)),
         };
 
         // Start the idle watcher
@@ -808,12 +831,25 @@ impl TranscriptionManager {
     ///
     /// Non-blocking: spawns a worker that waits for any in-progress model load,
     /// verifies the model supports streaming, then begins the stream. If the
-    /// model can't stream, the worker idles until finalize/cancel and reports
-    /// `None` so the caller falls back to batch transcription. Frames sent
-    /// before the stream begins queue on the channel and are not lost.
+    /// model can't stream, the route closes so the caller falls back to batch
+    /// transcription. Frames sent before the capability check queue on the
+    /// channel and are not lost.
     pub fn start_stream(&self) {
+        self.start_recording_worker(RecordingWorkerIntent::NativeStream);
+    }
+
+    /// Begin a candidate recording worker for non-streaming models. The worker
+    /// reuses the normal audio router and engine lease, then runtime-gates the
+    /// rolling path on the loaded session's `cohere_asr` architecture. Every
+    /// other batch model releases the route and retains the normal stop-time
+    /// fallback.
+    pub fn start_long_form_capture(&self) {
+        self.start_recording_worker(RecordingWorkerIntent::CohereRollingBatch);
+    }
+
+    fn start_recording_worker(&self, intent: RecordingWorkerIntent) {
         if self.router.is_open() || self.active_stream_worker.load(Ordering::Acquire) != 0 {
-            warn!("start_stream called while a stream worker is already active");
+            warn!("Recording worker start requested while another worker is already active");
             return;
         }
         let worker_id = self.next_stream_worker_id.fetch_add(1, Ordering::Relaxed);
@@ -822,17 +858,24 @@ impl TranscriptionManager {
             .compare_exchange(0, worker_id, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            warn!("start_stream lost a race with another stream worker");
+            warn!("Recording worker start lost a race with another worker");
             return;
         }
         let rx = self.router.open();
         self.stream_active.store(false, Ordering::Release);
+        self.rolling_cancel_requested
+            .store(false, Ordering::Release);
 
         let manager = self.clone();
-        thread::spawn(move || manager.run_stream_worker(rx, worker_id));
+        thread::spawn(move || manager.run_stream_worker(rx, worker_id, intent));
     }
 
-    fn run_stream_worker(&self, rx: mpsc::Receiver<StreamCmd>, worker_id: u64) {
+    fn run_stream_worker(
+        &self,
+        rx: mpsc::Receiver<StreamCmd>,
+        worker_id: u64,
+        intent: RecordingWorkerIntent,
+    ) {
         let _worker = StreamWorkerGuard {
             worker_id,
             active_stream_worker: Arc::clone(&self.active_stream_worker),
@@ -888,7 +931,7 @@ impl TranscriptionManager {
         // Only transcribe-cpp models expose streaming; ONNX engines fall back to
         // batch. The loaded session (not the ModelManager copy) is the source of
         // truth for run-path capabilities.
-        let (supports_streaming, supports_translate, languages) = match &engine {
+        let (model_arch, supports_streaming, supports_translate, languages) = match &engine {
             LoadedEngine::TranscribeCpp(session) => {
                 let model = session.model();
                 let caps = model.capabilities();
@@ -903,6 +946,7 @@ impl TranscriptionManager {
                     caps.languages,
                 );
                 (
+                    Some(model.arch().to_string()),
                     caps.supports_streaming,
                     caps.supports_translate,
                     caps.languages,
@@ -914,11 +958,13 @@ impl TranscriptionManager {
                      streaming is unavailable, using batch transcription",
                     model_id
                 );
-                (false, false, Vec::new())
+                (None, false, false, Vec::new())
             }
         };
 
-        if !supports_streaming {
+        let path_is_available =
+            recording_worker_path_available(intent, model_arch.as_deref(), supports_streaming);
+        if !path_is_available {
             self.return_engine(engine, &model_id);
             self.router.clear();
             drain_until_finalize(rx);
@@ -930,31 +976,45 @@ impl TranscriptionManager {
         let settings = get_settings(&self.app_handle);
         let effective_language =
             effective_language_for_model(&settings, self.model_manager.as_ref(), &model_id);
-        let run_plan = transcribe_cpp_run_plan(
+        let run_options = transcribe_cpp_run_options(
             settings.translate_to_english,
             &effective_language,
             &languages,
             supports_translate,
+            None,
         );
         let output_language = resolve_output_language_evidence(
             &settings,
-            run_plan.language.as_deref(),
+            run_options.language.as_deref(),
             &languages,
-            run_plan.target_language.as_deref() == Some("en"),
+            run_options.target_language.as_deref() == Some("en"),
         );
-        let run_options = RunOptions {
-            task: run_plan.task,
-            language: run_plan.language,
-            target_language: run_plan.target_language,
-            ..Default::default()
-        };
+
+        if intent == RecordingWorkerIntent::CohereRollingBatch {
+            let worker_result = match &mut engine {
+                LoadedEngine::TranscribeCpp(session) => self.run_cohere_rolling_worker(
+                    rx,
+                    session,
+                    &run_options,
+                    output_language,
+                    languages,
+                ),
+                _ => unreachable!("cohere_asr architecture requires a transcribe-cpp session"),
+            };
+
+            self.return_engine(engine, &model_id);
+            if let Some((reply, result)) = worker_result {
+                let _ = reply.send(result);
+            }
+            return;
+        }
 
         // Run the stream on the held session. The Stream borrows the session
         // (and thus the engine) for its lifetime, so the feed/finalize loop
         // lives in a labeled block — when it exits, the borrow is released and
         // the engine can be moved into return_engine().
-        let mut finalize_reply: Option<mpsc::Sender<Option<FinalizedStreamText>>> = None;
-        let mut finalize_result: Option<Option<FinalizedStreamText>> = None;
+        let mut finalize_reply: Option<mpsc::Sender<RecordingWorkerReply>> = None;
+        let mut finalize_result: Option<RecordingWorkerReply> = None;
         let stream_started = 'stream: {
             let session = match &mut engine {
                 LoadedEngine::TranscribeCpp(s) => s,
@@ -1037,10 +1097,11 @@ impl TranscriptionManager {
                                     }
                                     resolved => resolved.clone(),
                                 };
-                                Some(FinalizedStreamText {
+                                RecordingWorkerReply::Completed(FinalizedStreamText {
                                     text: stream.text().full,
                                     output_language,
                                     supported_languages: languages.clone(),
+                                    empty_is_complete: false,
                                 })
                             }
                             Err(e) => {
@@ -1049,11 +1110,11 @@ impl TranscriptionManager {
                                     "stream finalize failed: {}; falling back to batch transcription",
                                     e
                                 );
-                                None
+                                RecordingWorkerReply::Unavailable
                             }
                         };
                         let chars = match &result {
-                            Some(finalized) => finalized.text.len(),
+                            RecordingWorkerReply::Completed(finalized) => finalized.text.len(),
                             _ => 0,
                         };
                         perf.log_finalized(chars);
@@ -1106,7 +1167,8 @@ impl TranscriptionManager {
         }
     }
 
-    /// Flush the active stream and return its final, post-filtered text.
+    /// Flush the active recording worker and return its final, post-filtered
+    /// text.
     ///
     /// `Ok(None)` means no usable stream was active and the caller may fall back
     /// to batch transcription. `Err` means finalize itself failed or timed out.
@@ -1116,13 +1178,17 @@ impl TranscriptionManager {
         let Some(tx) = self.router.take() else {
             return Ok(None);
         };
+        let stop_to_raw_started = Instant::now();
         let (reply_tx, reply_rx) = mpsc::channel();
         if tx.send(StreamCmd::Finalize(reply_tx)).is_err() {
             return Ok(None);
         }
         let finalized = match reply_rx.recv_timeout(STREAM_FINALIZE_REPLY_TIMEOUT) {
-            Ok(Some(finalized)) => finalized,
-            Ok(None) => return Ok(None),
+            Ok(RecordingWorkerReply::Completed(finalized)) => finalized,
+            Ok(RecordingWorkerReply::Unavailable) => return Ok(None),
+            Ok(RecordingWorkerReply::Failed(message)) => {
+                return Err(anyhow::anyhow!(message));
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 self.stream_active.store(false, Ordering::Release);
@@ -1132,6 +1198,10 @@ impl TranscriptionManager {
                 ));
             }
         };
+        info!(
+            "Recording worker stop-to-raw-transcript latency: {:?}",
+            stop_to_raw_started.elapsed()
+        );
 
         let settings = get_settings(&self.app_handle);
         // Streaming models do not receive a decode prompt, so custom words
@@ -1144,12 +1214,18 @@ impl TranscriptionManager {
             &finalized.supported_languages,
         );
 
+        if filtered.trim().is_empty() && !finalized.empty_is_complete {
+            self.maybe_unload_immediately("streaming transcription");
+            return Ok(None);
+        }
+
         self.maybe_unload_immediately("streaming transcription");
         Ok(Some(filtered))
     }
 
     /// Abandon any active stream without producing text (e.g. on cancel).
     pub fn cancel_stream(&self) {
+        self.rolling_cancel_requested.store(true, Ordering::Release);
         if let Some(tx) = self.router.take() {
             let _ = tx.send(StreamCmd::Cancel);
         }
@@ -1174,6 +1250,19 @@ impl TranscriptionManager {
     }
 
     pub fn transcribe(&self, audio: Vec<f32>) -> Result<String> {
+        self.transcribe_with_cancel(audio, || false)
+    }
+
+    /// Batch-transcribe audio while allowing the recording action to stop a
+    /// long-form Cohere run between sequential model calls.
+    pub(crate) fn transcribe_with_cancel<C>(
+        &self,
+        audio: Vec<f32>,
+        is_cancelled: C,
+    ) -> Result<String>
+    where
+        C: Fn() -> bool,
+    {
         #[cfg(debug_assertions)]
         if std::env::var("HANDY_FORCE_TRANSCRIPTION_FAILURE").is_ok() {
             return Err(anyhow::anyhow!(
@@ -1316,22 +1405,16 @@ impl TranscriptionManager {
                             }))
                         };
 
-                        let run_plan = transcribe_cpp_run_plan(
+                        let run_options = transcribe_cpp_run_options(
                             settings.translate_to_english,
                             &validated_language,
                             &model_languages,
                             model_supports_translate,
-                        );
-                        output_was_translated = run_plan.target_language.as_deref() == Some("en");
-                        applied_language_hint = run_plan.language.clone();
-
-                        let run_options = RunOptions {
-                            task: run_plan.task,
-                            language: run_plan.language,
-                            target_language: run_plan.target_language,
                             family,
-                            ..Default::default()
-                        };
+                        );
+                        output_was_translated =
+                            run_options.target_language.as_deref() == Some("en");
+                        applied_language_hint = run_options.language.clone();
 
                         debug!(
                             "transcribe-cpp run: task={:?}, language={:?}, initial_prompt={}",
@@ -1340,17 +1423,28 @@ impl TranscriptionManager {
                             run_options.family.is_some()
                         );
 
-                        session
-                            .run(&audio, &run_options)
-                            .map(|t| {
-                                // Whisper's audio-based LID (auto mode only;
-                                // `None` when a language hint was passed).
-                                model_detected_language = t.language;
-                                t.text
-                            })
-                            .map_err(|e| {
-                                anyhow::anyhow!("transcribe-cpp transcription failed: {}", e)
-                            })
+                        if should_use_long_form_chunking(&session.model().arch(), audio.len()) {
+                            self.transcribe_cohere_chunks(
+                                session,
+                                &audio,
+                                &run_options,
+                                &settings,
+                                &is_cancelled,
+                                &mut model_detected_language,
+                            )
+                        } else {
+                            session
+                                .run(&audio, &run_options)
+                                .map(|t| {
+                                    // Whisper's audio-based LID (auto mode only;
+                                    // `None` when a language hint was passed).
+                                    model_detected_language = t.language;
+                                    t.text
+                                })
+                                .map_err(|e| {
+                                    anyhow::anyhow!("transcribe-cpp transcription failed: {}", e)
+                                })
+                        }
                     }
                     LoadedEngine::Parakeet(parakeet_engine) => {
                         let params = ParakeetParams {
@@ -1766,6 +1860,28 @@ fn transcribe_cpp_run_plan(
     }
 }
 
+fn transcribe_cpp_run_options(
+    translate_to_english: bool,
+    effective_language: &str,
+    model_languages: &[String],
+    model_supports_translate: bool,
+    family: Option<RunExtension>,
+) -> RunOptions {
+    let plan = transcribe_cpp_run_plan(
+        translate_to_english,
+        effective_language,
+        model_languages,
+        model_supports_translate,
+    );
+    RunOptions {
+        task: plan.task,
+        language: plan.language,
+        target_language: plan.target_language,
+        family,
+        ..Default::default()
+    }
+}
+
 fn post_process_transcription_text(
     raw: String,
     settings: &AppSettings,
@@ -1868,7 +1984,7 @@ fn drain_until_finalize(rx: mpsc::Receiver<StreamCmd>) {
         match cmd {
             StreamCmd::Feed(_) => {}
             StreamCmd::Finalize(reply) => {
-                let _ = reply.send(None);
+                let _ = reply.send(RecordingWorkerReply::Unavailable);
                 break;
             }
             StreamCmd::Cancel => break,
